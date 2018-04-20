@@ -531,6 +531,62 @@ DeleteSequenceTuple(Oid relid)
 }
 
 /*
+* Two-argument version of nextval, accepts
+*/
+Datum
+nextval_multi(PG_FUNCTION_ARGS)
+{
+	Oid					relid = PG_GETARG_OID(0);
+	int64				num = PG_GETARG_INT64(1);
+	Sequence_multi		multi = palloc(sizeof(Sequence_multi_data));
+	TupleDesc			resultTupleDesc;
+	HeapTuple			resultHeapTuple;
+	Datum				values[4];
+	bool				isnull[4];
+	Datum				result;
+
+	/* same as in regular nextval */
+
+	multi->count = num;
+	multi->first_value = -1;
+	multi->last_value = -1;
+	multi->increment = -1;
+
+	nextval_internal(relid, true, multi);
+
+	/*
+	* Construct a tuple descriptor for the result row.  This must match this
+	* function's pg_proc entry!
+	*/
+	resultTupleDesc = CreateTemplateTupleDesc(4, false);
+	TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "count",
+		INT8OID, -1, 0);
+	TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "first_value",
+		INT8OID, -1, 0);
+	TupleDescInitEntry(resultTupleDesc, (AttrNumber)3, "last_value",
+		INT8OID, -1, 0);
+	TupleDescInitEntry(resultTupleDesc, (AttrNumber)4, "increment",
+		INT8OID, -1, 0);
+
+	resultTupleDesc = BlessTupleDesc(resultTupleDesc);
+
+	values[0] = DatumGetInt64(multi->count);
+	values[1] = DatumGetInt64(multi->first_value);
+	values[2] = DatumGetInt64(multi->last_value);
+	values[3] = DatumGetInt64(multi->increment);
+	isnull[0] = false;
+	isnull[1] = false;
+	isnull[2] = false;
+	isnull[3] = false;
+
+	resultHeapTuple = heap_form_tuple(resultTupleDesc, values, isnull);
+
+	result = HeapTupleGetDatum(resultHeapTuple);
+
+	PG_RETURN_DATUM(result);
+}
+
+/*
  * Note: nextval with a text argument is no longer exported as a pg_proc
  * entry, but we keep it around to ease porting of C code that may have
  * called the function directly.
@@ -554,7 +610,7 @@ nextval(PG_FUNCTION_ARGS)
 	 */
 	relid = RangeVarGetRelid(sequence, NoLock, false);
 
-	PG_RETURN_INT64(nextval_internal(relid, true));
+	PG_RETURN_INT64(nextval_internal(relid, true, NULL));
 }
 
 Datum
@@ -562,11 +618,11 @@ nextval_oid(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 
-	PG_RETURN_INT64(nextval_internal(relid, true));
+	PG_RETURN_INT64(nextval_internal(relid, true, NULL));
 }
 
 int64
-nextval_internal(Oid relid, bool check_permissions)
+nextval_internal(Oid relid, bool check_permissions, Sequence_multi multi)
 {
 	SeqTable	elm;
 	Relation	seqrel;
@@ -577,6 +633,7 @@ nextval_internal(Oid relid, bool check_permissions)
 	HeapTupleData seqdatatuple;
 	Form_pg_sequence_data seq;
 	int64		incby,
+				num,
 				maxv,
 				minv,
 				cache,
@@ -591,6 +648,11 @@ nextval_internal(Oid relid, bool check_permissions)
 
 	/* open and lock sequence */
 	init_sequence(relid, &elm, &seqrel);
+
+	if (multi == NULL)
+		num = 0;
+	else
+		num = multi->count - 1;
 
 	if (check_permissions &&
 		pg_class_aclcheck(elm->relid, GetUserId(),
@@ -611,11 +673,24 @@ nextval_internal(Oid relid, bool check_permissions)
 	 */
 	PreventCommandIfParallelMode("nextval()");
 
-	if (elm->last != elm->cached)	/* some numbers were cached */
+	/* if enough numbers were cached and this is not the 1st call of nextval_internal*/
+	if ((elm->increment != 0) && (elm->last + (num + 1) * elm->increment <= elm->cached))	
 	{
 		Assert(elm->last_valid);
-		Assert(elm->increment != 0);
-		elm->last += elm->increment;
+		/* Assert(elm->increment != 0); this assert becomes useless*/
+
+		last = elm->last;
+		elm->last += (num + 1) * elm->increment;
+
+		/* if this is nextval_multi call, then we need to populate sequence_multi structure*/
+		if (multi != NULL)
+		{
+			/* we don't need to update the count since we obviously had enough values to pull */
+			multi->first_value = last;
+			multi->last_value = elm->last;
+			multi->increment = elm->increment;
+		}
+
 		relation_close(seqrel, NoLock);
 		last_used_seq = elm;
 		return elm->last;
@@ -628,7 +703,7 @@ nextval_internal(Oid relid, bool check_permissions)
 	incby = pgsform->seqincrement;
 	maxv = pgsform->seqmax;
 	minv = pgsform->seqmin;
-	cache = pgsform->seqcache;
+	cache = (1 + num) * pgsform->seqcache;
 	cycle = pgsform->seqcycle;
 	ReleaseSysCache(pgstuple);
 
@@ -640,6 +715,9 @@ nextval_internal(Oid relid, bool check_permissions)
 	last = next = result = seq->last_value;
 	fetch = cache;
 	log = seq->log_cnt;
+
+	if (multi != NULL)
+		multi->first_value = last;
 
 	if (!seq->is_called)
 	{
@@ -684,8 +762,8 @@ nextval_internal(Oid relid, bool check_permissions)
 		if (incby > 0)
 		{
 			/* ascending sequence */
-			if ((maxv >= 0 && next > maxv - incby) ||
-				(maxv < 0 && next + incby > maxv))
+			if ((maxv >= 0 && next > maxv - (num + 1) * incby) ||
+				(maxv < 0 && next + (num + 1) * incby > maxv))
 			{
 				if (rescnt > 0)
 					break;		/* stop fetching */
@@ -702,13 +780,13 @@ nextval_internal(Oid relid, bool check_permissions)
 				next = minv;
 			}
 			else
-				next += incby;
+				next += (num + 1) * incby;
 		}
 		else
 		{
 			/* descending sequence */
-			if ((minv < 0 && next < minv - incby) ||
-				(minv >= 0 && next + incby < minv))
+			if ((minv < 0 && next < minv - (num + 1) * incby) ||
+				(minv >= 0 && next + (num + 1) * incby < minv))
 			{
 				if (rescnt > 0)
 					break;		/* stop fetching */
@@ -725,16 +803,24 @@ nextval_internal(Oid relid, bool check_permissions)
 				next = maxv;
 			}
 			else
-				next += incby;
+				next += (num + 1) * incby;
 		}
-		fetch--;
+		fetch-= (num + 1);
+		num = 0;
 		if (rescnt < cache)
 		{
 			log--;
 			rescnt++;
 			last = next;
 			if (rescnt == 1)	/* if it's first result - */
+			{
 				result = next;	/* it's what to return */
+				if (multi != NULL)
+				{
+					multi->increment = incby;
+					multi->last_value = result;
+				}
+			}
 		}
 	}
 
@@ -1760,19 +1846,12 @@ sequence_options(Oid relid)
 		elog(ERROR, "cache lookup failed for sequence %u", relid);
 	pgsform = (Form_pg_sequence) GETSTRUCT(pgstuple);
 
-	/* Use makeFloat() for 64-bit integers, like gram.y does. */
-	options = lappend(options,
-					  makeDefElem("cache", (Node *) makeFloat(psprintf(INT64_FORMAT, pgsform->seqcache)), -1));
-	options = lappend(options,
-					  makeDefElem("cycle", (Node *) makeInteger(pgsform->seqcycle), -1));
-	options = lappend(options,
-					  makeDefElem("increment", (Node *) makeFloat(psprintf(INT64_FORMAT, pgsform->seqincrement)), -1));
-	options = lappend(options,
-					  makeDefElem("maxvalue", (Node *) makeFloat(psprintf(INT64_FORMAT, pgsform->seqmax)), -1));
-	options = lappend(options,
-					  makeDefElem("minvalue", (Node *) makeFloat(psprintf(INT64_FORMAT, pgsform->seqmin)), -1));
-	options = lappend(options,
-					  makeDefElem("start", (Node *) makeFloat(psprintf(INT64_FORMAT, pgsform->seqstart)), -1));
+	options = lappend(options, makeDefElem("cache", (Node *) makeInteger(pgsform->seqcache), -1));
+	options = lappend(options, makeDefElem("cycle", (Node *) makeInteger(pgsform->seqcycle), -1));
+	options = lappend(options, makeDefElem("increment", (Node *) makeInteger(pgsform->seqincrement), -1));
+	options = lappend(options, makeDefElem("maxvalue", (Node *) makeInteger(pgsform->seqmax), -1));
+	options = lappend(options, makeDefElem("minvalue", (Node *) makeInteger(pgsform->seqmin), -1));
+	options = lappend(options, makeDefElem("start", (Node *) makeInteger(pgsform->seqstart), -1));
 
 	ReleaseSysCache(pgstuple);
 

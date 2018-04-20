@@ -1985,7 +1985,7 @@ ExecEvalCurrentOfExpr(ExprState *state, ExprEvalStep *op)
 void
 ExecEvalNextValueExpr(ExprState *state, ExprEvalStep *op)
 {
-	int64		newval = nextval_internal(op->d.nextvalueexpr.seqid, false);
+	int64		newval = nextval_internal(op->d.nextvalueexpr.seqid, false, NULL);
 
 	switch (op->d.nextvalueexpr.seqtypid)
 	{

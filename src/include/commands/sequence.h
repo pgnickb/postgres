@@ -31,6 +31,16 @@ typedef struct FormData_pg_sequence_data
 
 typedef FormData_pg_sequence_data *Form_pg_sequence_data;
 
+typedef struct Sequence_multi_data
+{
+	int64		count;
+	int64		first_value;
+	int64		last_value;
+	int64		increment;
+} Sequence_multi_data;
+
+typedef Sequence_multi_data *Sequence_multi;
+
 /*
  * Columns of a sequence relation
  */
@@ -51,8 +61,9 @@ typedef struct xl_seq_rec
 	/* SEQUENCE TUPLE DATA FOLLOWS AT THE END */
 } xl_seq_rec;
 
-extern int64 nextval_internal(Oid relid, bool check_permissions);
+extern int64 nextval_internal(Oid relid, bool check_permissions, Sequence_multi multi);
 extern Datum nextval(PG_FUNCTION_ARGS);
+extern Datum nextval_multi(PG_FUNCTION_ARGS);
 extern List *sequence_options(Oid relid);
 
 extern ObjectAddress DefineSequence(ParseState *pstate, CreateSeqStmt *stmt);
